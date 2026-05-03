@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """
-Extract text from a PDF file for book-to-skill processing.
+Extract text from a PDF or EPUB file for book-to-skill processing.
 
-Tries extraction methods in order:
+PDF extraction tries methods in order:
   1. pdftotext (poppler-utils) — best quality
   2. PyPDF2 — common Python library
   3. pdfminer.six — thorough fallback
+
+EPUB extraction tries methods in order:
+  1. ebooklib + BeautifulSoup4 — best quality
+  2. zipfile + html.parser — stdlib fallback (no extra deps)
 
 Outputs:
   /tmp/book_skill_work/full_text.txt  — full extracted text
   /tmp/book_skill_work/metadata.json  — stats and metadata
 """
 
+import html
+import html.parser
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 OUTPUT_DIR = Path("/tmp/book_skill_work")
@@ -73,6 +81,123 @@ def extract_with_pdfminer(pdf_path: str) -> str | None:
         return None
 
 
+def extract_with_ebooklib(epub_path: str) -> str | None:
+    try:
+        import ebooklib
+        from ebooklib import epub
+        from bs4 import BeautifulSoup
+
+        book = epub.read_epub(epub_path)
+        parts = []
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            parts.append(soup.get_text(separator="\n"))
+        return "\n\n".join(parts)
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+class _HTMLTextExtractor(html.parser.HTMLParser):
+    """Minimal HTML → plain text converter using stdlib only."""
+
+    SKIP_TAGS = {"script", "style", "head"}
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+        self._current_skip: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        if tag in ("p", "br", "h1", "h2", "h3", "h4", "h5", "h6", "li", "div"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return html.unescape("".join(self._parts))
+
+
+def extract_with_zipfile(epub_path: str) -> str | None:
+    """stdlib-only EPUB extractor: unzip → parse HTML files."""
+    try:
+        with zipfile.ZipFile(epub_path) as zf:
+            names = zf.namelist()
+            # Read OPF spine to get reading order, fall back to sorted xhtml files
+            spine_order: list[str] = []
+            opf_files = [n for n in names if n.endswith(".opf")]
+            if opf_files:
+                opf_text = zf.read(opf_files[0]).decode("utf-8", errors="replace")
+                spine_order = re.findall(r'href=["\']([^"\']+\.(?:xhtml|html))["\']', opf_text)
+
+            html_files = spine_order or sorted(
+                n for n in names if n.endswith((".html", ".xhtml"))
+            )
+            if not html_files:
+                return None
+
+            parts = []
+            for name in html_files:
+                try:
+                    raw = zf.read(name).decode("utf-8", errors="replace")
+                    parser = _HTMLTextExtractor()
+                    parser.feed(raw)
+                    parts.append(parser.get_text())
+                except Exception:
+                    continue
+            return "\n\n".join(parts) if parts else None
+    except Exception:
+        return None
+
+
+def extract_epub(epub_path: str) -> tuple[str, str]:
+    """Return (text, method) for an EPUB file."""
+    print("Trying ebooklib + BeautifulSoup4...", end=" ", flush=True)
+    text = extract_with_ebooklib(epub_path)
+    if text and text.strip():
+        print("OK")
+        return text, "ebooklib"
+
+    print("not available")
+    print("Trying stdlib zipfile parser...", end=" ", flush=True)
+    text = extract_with_zipfile(epub_path)
+    if text and text.strip():
+        print("OK")
+        return text, "zipfile"
+
+    print("FAILED")
+    print(
+        "\nERROR: Could not extract text from EPUB.\n"
+        "Install ebooklib + beautifulsoup4 for best results:\n"
+        "  pip3 install ebooklib beautifulsoup4",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def count_epub_chapters(epub_path: str) -> int:
+    """Count spine items (approximate chapter count) without dependencies."""
+    try:
+        with zipfile.ZipFile(epub_path) as zf:
+            opf_files = [n for n in zf.namelist() if n.endswith(".opf")]
+            if not opf_files:
+                return 0
+            opf_text = zf.read(opf_files[0]).decode("utf-8", errors="replace")
+            return len(re.findall(r'<itemref\b', opf_text))
+    except Exception:
+        return 0
+
+
 def count_pages(pdf_path: str) -> int:
     # Try pdfinfo first
     if shutil.which("pdfinfo"):
@@ -119,64 +244,92 @@ def detect_structure(text: str) -> dict:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: extract.py <path-to-pdf>", file=sys.stderr)
+        print("Usage: extract.py <path-to-pdf-or-epub>", file=sys.stderr)
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
+    input_path = sys.argv[1]
 
-    if not os.path.exists(pdf_path):
-        print(f"ERROR: File not found: {pdf_path}", file=sys.stderr)
+    if not os.path.exists(input_path):
+        print(f"ERROR: File not found: {input_path}", file=sys.stderr)
         sys.exit(1)
+
+    ext = Path(input_path).suffix.lower()
+    is_epub = ext == ".epub"
+    is_pdf = ext == ".pdf"
+
+    if not is_epub and not is_pdf:
+        # Sniff magic bytes as fallback
+        with open(input_path, "rb") as f:
+            header = f.read(8)
+        if header[:4] == b"%PDF":
+            is_pdf = True
+        elif header[:2] == b"PK":  # ZIP magic → likely EPUB
+            is_epub = True
+        else:
+            print(
+                f"ERROR: Unsupported format '{ext}'. Supported: .pdf, .epub",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Extracting: {pdf_path}")
-    print("Trying pdftotext...", end=" ", flush=True)
-    text = extract_with_pdftotext(pdf_path)
-
-    if text:
-        method = "pdftotext"
-        print("OK")
+    if is_epub:
+        print(f"Extracting EPUB: {input_path}")
+        text, method = extract_epub(input_path)
+        pages = count_epub_chapters(input_path)
+        pages_label = "spine_items"
     else:
-        print("not available")
-        print("Trying PyPDF2...", end=" ", flush=True)
-        text = extract_with_pypdf2(pdf_path)
+        print(f"Extracting PDF: {input_path}")
+        print("Trying pdftotext...", end=" ", flush=True)
+        text = extract_with_pdftotext(input_path)
+
         if text:
-            method = "PyPDF2"
+            method = "pdftotext"
             print("OK")
         else:
             print("not available")
-            print("Trying pdfminer.six...", end=" ", flush=True)
-            text = extract_with_pdfminer(pdf_path)
+            print("Trying PyPDF2...", end=" ", flush=True)
+            text = extract_with_pypdf2(input_path)
             if text:
-                method = "pdfminer"
+                method = "PyPDF2"
                 print("OK")
             else:
-                print("FAILED")
-                print(
-                    "\nERROR: Could not extract text from PDF.\n"
-                    "Install one of: poppler-utils (pdftotext), PyPDF2, or pdfminer.six\n"
-                    "  sudo apt install poppler-utils\n"
-                    "  pip3 install PyPDF2\n"
-                    "  pip3 install pdfminer.six",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+                print("not available")
+                print("Trying pdfminer.six...", end=" ", flush=True)
+                text = extract_with_pdfminer(input_path)
+                if text:
+                    method = "pdfminer"
+                    print("OK")
+                else:
+                    print("FAILED")
+                    print(
+                        "\nERROR: Could not extract text from PDF.\n"
+                        "Install one of: poppler-utils (pdftotext), PyPDF2, or pdfminer.six\n"
+                        "  sudo apt install poppler-utils\n"
+                        "  pip3 install PyPDF2\n"
+                        "  pip3 install pdfminer.six",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+        pages = count_pages(input_path)
+        pages_label = "pages"
 
     # Write full text
     OUTPUT_TEXT.write_text(text, encoding="utf-8")
 
-    pages = count_pages(pdf_path)
     tokens = estimate_tokens(text)
     structure = detect_structure(text)
-    file_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+    file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
 
     metadata = {
-        "source_file": str(Path(pdf_path).resolve()),
-        "filename": Path(pdf_path).name,
+        "source_file": str(Path(input_path).resolve()),
+        "filename": Path(input_path).name,
+        "format": "epub" if is_epub else "pdf",
         "extraction_method": method,
         "file_size_mb": round(file_size_mb, 2),
-        "pages": pages,
+        pages_label: pages,
         "chars": len(text),
         "words": len(text.split()),
         "estimated_tokens": tokens,
@@ -187,9 +340,11 @@ def main():
 
     OUTPUT_META.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
+    page_line = f"   {'Spine items' if is_epub else 'Pages'}: {pages}"
     print(f"\n📖 Extraction complete:")
+    print(f"   Format  : {'EPUB' if is_epub else 'PDF'}")
     print(f"   Method  : {method}")
-    print(f"   Pages   : {pages}")
+    print(page_line)
     print(f"   Words   : {len(text.split()):,}")
     print(f"   Tokens  : ~{tokens // 1000}K")
     print(f"   Chapters: {structure['chapters_detected']} detected")

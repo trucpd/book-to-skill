@@ -1,13 +1,13 @@
 ---
 name: book-to-skill
-description: Converts a technical book PDF into a structured Claude Code skill — extracting frameworks, mental models, principles, techniques, and anti-patterns the author crystallized. Use when the user wants to study a book through Claude, apply an author's frameworks while working, or build a reusable knowledge base from any PDF.
-when_to_use: Trigger phrases — "turn this book into a skill", "create a skill from this PDF", "I want to study X book", "add this book to my skills", "convert PDF to skill", "analyze this book", "extract frameworks from this book". Accepts a path to a PDF and optional skill name slug.
+description: Converts a technical book (PDF or EPUB) into a structured Claude Code skill — extracting frameworks, mental models, principles, techniques, and anti-patterns the author crystallized. Use when the user wants to study a book through Claude, apply an author's frameworks while working, or build a reusable knowledge base from any PDF or EPUB.
+when_to_use: Trigger phrases — "turn this book into a skill", "create a skill from this PDF", "create a skill from this EPUB", "I want to study X book", "add this book to my skills", "convert PDF to skill", "convert EPUB to skill", "analyze this book", "extract frameworks from this book". Accepts a path to a PDF or EPUB and optional skill name slug.
 disable-model-invocation: true
 context: fork
 agent: general-purpose
 allowed-tools: Bash(python3 *) Bash(pdftotext *) Bash(mkdir *) Bash(cp *) Bash(find *) Bash(wc *) Bash(echo *) Bash(cat *) Bash(date *) Read Write Glob Grep
-argument-hint: <path-to-pdf> [skill-name-slug]
-arguments: [pdf_path, skill_name]
+argument-hint: <path-to-pdf-or-epub> [skill-name-slug]
+arguments: [book_path, skill_name]
 effort: high
 ---
 
@@ -55,8 +55,8 @@ Three paths available. Route based on what the user asks:
 
 ## Step 0 — Out-of-scope check
 
-If the argument is NOT a path to a PDF, stop and respond:
-> "book-to-skill requires a PDF path. Usage: `/book-to-skill /path/to/book.pdf [skill-name]`"
+If the argument is NOT a path to a PDF or EPUB file, stop and respond:
+> "book-to-skill requires a PDF or EPUB path. Usage: `/book-to-skill /path/to/book.pdf [skill-name]` or `/book-to-skill /path/to/book.epub [skill-name]`"
 
 ---
 
@@ -64,14 +64,16 @@ If the argument is NOT a path to a PDF, stop and respond:
 
 ```bash
 test -f "$0" && echo "FILE_OK" || echo "FILE_NOT_FOUND: $0"
-file "$0" | grep -i pdf && echo "IS_PDF" || echo "NOT_PDF"
+file "$0" | grep -iE "pdf|epub|zip" && echo "FORMAT_OK" || echo "FORMAT_UNKNOWN"
 ```
 
-If the file is not found or not a PDF, stop with a clear error message.
+Check the file extension (`.pdf` or `.epub`) or magic bytes (`%PDF` or `PK` zip header).
+
+If the file is not found or the format is not supported, stop with a clear error message listing supported formats.
 
 ---
 
-## Step 2 — Extract text from PDF
+## Step 2 — Extract text from PDF or EPUB
 
 Run the extraction script:
 
@@ -92,8 +94,8 @@ Read `/tmp/book_skill_work/metadata.json` to understand what was extracted.
 Read `/tmp/book_skill_work/metadata.json` and present the user with an estimate **before doing any generation**:
 
 ```
-📖 Book detected: <filename>
-📄 Pages: ~<N> | Words: ~<N> | Source tokens: ~<N>K
+📖 Book detected: <filename> (<format: PDF or EPUB>)
+📄 Pages/Spine items: ~<N> | Words: ~<N> | Source tokens: ~<N>K
 
 💰 Estimated token cost (Full Conversion):
    Input  (book reading + prompts): ~<N>K tokens
